@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/oopsguy/m3u8/dl"
+	"github.com/wellmoon/m3u8/dl"
 )
 
 var (
@@ -16,7 +16,7 @@ var (
 
 func init() {
 	flag.StringVar(&url, "u", "", "M3U8 URL, required")
-	flag.IntVar(&chanSize, "c", 25, "Maximum number of occurrences")
+	flag.IntVar(&chanSize, "c", 8, "Maximum number of occurrences")
 	flag.StringVar(&output, "o", "", "Output folder, required")
 }
 

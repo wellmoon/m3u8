@@ -10,8 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/oopsguy/m3u8/parse"
-	"github.com/oopsguy/m3u8/tool"
+	"github.com/wellmoon/m3u8/parse"
+	"github.com/wellmoon/m3u8/tool"
 )
 
 const (
@@ -104,19 +104,17 @@ func (d *Downloader) Start(concurrency int) error {
 func (d *Downloader) download(segIndex int) error {
 	tsFilename := tsFilename(segIndex)
 	tsUrl := d.tsURL(segIndex)
-	b, e := tool.Get(tsUrl)
+	bytes, e := tool.GetBytes(tsUrl)
 	if e != nil {
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
 	}
 	//noinspection GoUnhandledErrorResult
-	defer b.Close()
 	fPath := filepath.Join(d.tsFolder, tsFilename)
 	fTemp := fPath + tsTempFileSuffix
 	f, err := os.Create(fTemp)
 	if err != nil {
 		return fmt.Errorf("create file: %s, %s", tsFilename, err.Error())
 	}
-	bytes, err := ioutil.ReadAll(b)
 	if err != nil {
 		return fmt.Errorf("read bytes: %s, %s", tsUrl, err.Error())
 	}
@@ -127,7 +125,7 @@ func (d *Downloader) download(segIndex int) error {
 	key, ok := d.result.Keys[sf.KeyIndex]
 	if ok && key != "" {
 		bytes, err = tool.AES128Decrypt(bytes, []byte(key),
-			[]byte(d.result.M3u8.Keys[sf.KeyIndex].IV))
+			[]byte(d.result.M3u8.Keys[sf.KeyIndex].IV), tsUrl)
 		if err != nil {
 			return fmt.Errorf("decryt: %s, %s", tsUrl, err.Error())
 		}
