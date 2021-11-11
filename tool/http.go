@@ -39,9 +39,10 @@ func Get(url string) (io.ReadCloser, error) {
 func GetBytes(url string) ([]byte, error) {
 	res, err := grequests.Get(url, grequestotp)
 	if err != nil {
-		fmt.Println("grequest error")
+		fmt.Println("grequest error : ", err)
 		return nil, err
 	}
+	defer res.Close()
 	if res.StatusCode != 200 {
 		return nil, fmt.Errorf("http error: status code %d", res.StatusCode)
 	}
