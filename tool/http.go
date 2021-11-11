@@ -42,5 +42,8 @@ func GetBytes(url string) ([]byte, error) {
 		fmt.Println("grequest error")
 		return nil, err
 	}
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("http error: status code %d", res.StatusCode)
+	}
 	return res.Bytes(), nil
 }
