@@ -17,5 +17,9 @@
 # vendor/
 
 .idea
-m3u8
-/test
+.DS_Store
+go.mod
+go.sum
+logs
+tmp
+download
