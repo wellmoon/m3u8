@@ -16,7 +16,7 @@ var (
 
 func init() {
 	flag.StringVar(&url, "u", "", "M3U8 URL, required")
-	flag.IntVar(&chanSize, "c", 8, "Maximum number of occurrences")
+	flag.IntVar(&chanSize, "c", 1, "Maximum number of occurrences")
 	flag.StringVar(&output, "o", "", "Output folder, required")
 }
 
@@ -37,11 +37,11 @@ func main() {
 	if chanSize <= 0 {
 		panic("parameter 'c' must be greater than 0")
 	}
-	downloader, err := dl.NewTask(output, url)
+	downloader, err := dl.NewTask(output, url, nil)
 	if err != nil {
 		panic(err)
 	}
-	if err := downloader.Start(chanSize); err != nil {
+	if err := downloader.Start(chanSize, nil); err != nil {
 		panic(err)
 	}
 	fmt.Println("Done!")

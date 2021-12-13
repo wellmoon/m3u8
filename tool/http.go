@@ -22,11 +22,21 @@ var (
 	}
 )
 
-func Get(url string) (io.ReadCloser, error) {
+func Get(url string, headers map[string]string) (io.ReadCloser, error) {
 	c := http.Client{
 		Timeout: time.Duration(60) * time.Second,
 	}
-	resp, err := c.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if nil != headers && len(headers) > 0 {
+		for key, val := range headers {
+			req.Header.Add(key, val)
+		}
+	}
+	resp, err := c.Do(req)
+	// resp, err := c.Get(url)
 	if err != nil {
 		return nil, err
 	}

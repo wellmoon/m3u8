@@ -34,8 +34,8 @@ type Downloader struct {
 }
 
 // NewTask returns a Task instance
-func NewTask(output string, url string) (*Downloader, error) {
-	result, err := parse.FromURL(url)
+func NewTask(output string, url string, headers map[string]string) (*Downloader, error) {
+	result, err := parse.FromURL(url, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func NewTask(output string, url string) (*Downloader, error) {
 }
 
 // Start runs downloader
-func (d *Downloader) Start(concurrency int) error {
+func (d *Downloader) Start(concurrency int, parseUrl func(string) string) error {
 	var wg sync.WaitGroup
 	// struct{} zero size
 	limitChan := make(chan struct{}, concurrency)
@@ -83,7 +83,7 @@ func (d *Downloader) Start(concurrency int) error {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			if err := d.download(idx); err != nil {
+			if err := d.download(idx, parseUrl); err != nil {
 				// Back into the queue, retry request
 				fmt.Printf("[failed] %s\n", err.Error())
 				if err := d.back(idx); err != nil {
@@ -101,9 +101,12 @@ func (d *Downloader) Start(concurrency int) error {
 	return nil
 }
 
-func (d *Downloader) download(segIndex int) error {
+func (d *Downloader) download(segIndex int, parseUrl func(url string) string) error {
 	tsFilename := tsFilename(segIndex)
 	tsUrl := d.tsURL(segIndex)
+	if parseUrl != nil {
+		tsUrl = parseUrl(tsUrl)
+	}
 	bytes, e := tool.GetBytes(tsUrl)
 	if e != nil {
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
@@ -150,6 +153,8 @@ func (d *Downloader) download(segIndex int) error {
 	if err = os.Rename(fTemp, fPath); err != nil {
 		return err
 	}
+	// 给第一个文件增加水印
+
 	// Maybe it will be safer in this way...
 	atomic.AddInt32(&d.finish, 1)
 	//tool.DrawProgressBar("Downloading", float32(d.finish)/float32(d.segLen), progressWidth)
