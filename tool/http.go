@@ -46,7 +46,8 @@ func Get(url string, headers map[string]string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func GetBytes(url string) ([]byte, error) {
+func GetBytes(url string, headers map[string]string) ([]byte, error) {
+	grequestotp.Headers = headers
 	res, err := grequests.Get(url, grequestotp)
 	if err != nil {
 		fmt.Println("grequest error : ", err)

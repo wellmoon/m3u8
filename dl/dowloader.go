@@ -2,6 +2,7 @@ package dl
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -29,9 +30,28 @@ type Downloader struct {
 	tsFolder string
 	finish   int32
 	segLen   int
+	headers  map[string]string
 
 	result *parse.Result
 }
+
+func (d *Downloader) GetDuration() int {
+	arr := d.result.M3u8.Segments
+	duration := 0
+	for _, s := range arr {
+		duration = duration + int(s.Duration)
+	}
+	return duration
+}
+
+// func (d *Downloader) GetFileSize() int {
+// 	arr := d.result.M3u8.Segments
+// 	size := 0
+// 	for _, s := range arr {
+// 		size = size + int(s.Length)
+// 	}
+// 	return size
+// }
 
 // NewTask returns a Task instance
 func NewTask(output string, url string, headers map[string]string) (*Downloader, error) {
@@ -61,6 +81,7 @@ func NewTask(output string, url string, headers map[string]string) (*Downloader,
 		folder:   folder,
 		tsFolder: tsFolder,
 		result:   result,
+		headers:  headers,
 	}
 	d.segLen = len(result.M3u8.Segments)
 	d.queue = genSlice(d.segLen)
@@ -107,7 +128,7 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	if parseUrl != nil {
 		tsUrl = parseUrl(tsUrl)
 	}
-	bytes, e := tool.GetBytes(tsUrl)
+	bytes, e := tool.GetBytes(tsUrl, d.headers)
 	if e != nil {
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
 	}
@@ -218,22 +239,28 @@ func (d *Downloader) merge() error {
 	for segIndex := 0; segIndex < d.segLen; segIndex++ {
 		tsFilename := tsFilename(segIndex)
 		bytes, err := ioutil.ReadFile(filepath.Join(d.tsFolder, tsFilename))
-		_, err = writer.Write(bytes)
 		if err != nil {
+			fmt.Printf("read files %d error, err is %s\n ", segIndex, err)
 			continue
 		}
+		_, err = writer.Write(bytes)
+		if err != nil {
+			fmt.Printf("write files %d error, err is %s\n ", segIndex, err)
+			continue
+		}
+		os.Remove(tsFilename)
 		mergedCount++
 		tool.DrawProgressBar("merge",
 			float32(mergedCount)/float32(d.segLen), progressWidth)
 	}
 	_ = writer.Flush()
-	// Remove `ts` folder
-	_ = os.RemoveAll(d.tsFolder)
 
 	if mergedCount != d.segLen {
 		fmt.Printf("[warning] \n%d files merge failed", d.segLen-mergedCount)
+		return errors.New("merge failded")
 	}
-
+	// Remove `ts` folder
+	_ = os.RemoveAll(d.tsFolder)
 	fmt.Printf("\n[output] %s\n", mFilePath)
 
 	return nil
