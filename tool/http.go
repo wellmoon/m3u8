@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,15 +48,71 @@ func Get(url string, headers map[string]string) (io.ReadCloser, error) {
 }
 
 func GetBytes(url string, headers map[string]string) ([]byte, error) {
-	grequestotp.Headers = headers
-	res, err := grequests.Get(url, grequestotp)
+	c := http.Client{
+		Timeout: time.Duration(300) * time.Second,
+	}
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Println("grequest error : ", err)
 		return nil, err
 	}
-	defer res.Close()
-	if res.StatusCode != 200 {
-		return nil, fmt.Errorf("http error: status code %d", res.StatusCode)
+	if nil != headers && len(headers) > 0 {
+		for key, val := range headers {
+			req.Header.Add(key, val)
+		}
 	}
-	return res.Bytes(), nil
+	resp, err := c.Do(req)
+	// resp, err := c.Get(url)
+	if err != nil {
+		fmt.Println("c.Do err", err)
+		return nil, err
+	}
+	if resp == nil {
+		resp.Body.Close()
+		return nil, errors.New("fatal, resp is nil")
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("http error: status code %d", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+	// 用ioutil.ReadAll可能户内存溢出，自己重写ReadAll方法，把之前的512改为256
+	bytes, err := ReadAll(resp.Body)
+	// var buf bytes.Buffer
+	// fmt.Println("start io copy")
+	// _, err = io.Copy(&buf, resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return bytes, nil
 }
+
+func ReadAll(r io.Reader) ([]byte, error) {
+	b := make([]byte, 0, 256)
+	for {
+		if len(b) == cap(b) {
+			// Add more capacity (let append pick how much).
+			b = append(b, 0)[:len(b)]
+		}
+		n, err := r.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return b, err
+		}
+	}
+}
+
+// func GetBytes(url string, headers map[string]string) ([]byte, error) {
+// 	grequestotp.Headers = headers
+// 	res, err := grequests.Get(url, grequestotp)
+// 	if err != nil {
+// 		fmt.Println("grequest error : ", err)
+// 		return nil, err
+// 	}
+// 	defer res.Close()
+// 	if res.StatusCode != 200 {
+// 		return nil, fmt.Errorf("http error: status code %d", res.StatusCode)
+// 	}
+// 	return res.Bytes(), nil
+// }

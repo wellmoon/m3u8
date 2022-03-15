@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/wellmoon/m3u8/parse"
 	"github.com/wellmoon/m3u8/tool"
@@ -102,18 +104,21 @@ func (d *Downloader) Start(concurrency int, parseUrl func(string) string) error 
 			continue
 		}
 		wg.Add(1)
+		limitChan <- struct{}{}
 		go func(idx int) {
-			defer wg.Done()
+			defer func() {
+				wg.Done()
+				<-limitChan
+			}()
 			if err := d.download(idx, parseUrl); err != nil {
 				// Back into the queue, retry request
-				fmt.Printf("[failed] %s\n", err.Error())
+				// fmt.Printf("[failed] %s\n", err.Error())
 				if err := d.back(idx); err != nil {
-					fmt.Printf(err.Error())
+					fmt.Println(err.Error())
 				}
 			}
-			<-limitChan
 		}(tsIdx)
-		limitChan <- struct{}{}
+
 	}
 	wg.Wait()
 	if err := d.merge(); err != nil {
@@ -130,6 +135,13 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	}
 	bytes, e := tool.GetBytes(tsUrl, d.headers)
 	if e != nil {
+		if strings.Contains(e.Error(), "429") {
+			time.Sleep(time.Duration(3) * time.Second)
+		}
+		if strings.Contains(e.Error(), "fatal") {
+			atomic.AddInt32(&d.finish, 1)
+			return nil
+		}
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
 	}
 	//noinspection GoUnhandledErrorResult
@@ -138,9 +150,6 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	f, err := os.Create(fTemp)
 	if err != nil {
 		return fmt.Errorf("create file: %s, %s", tsFilename, err.Error())
-	}
-	if err != nil {
-		return fmt.Errorf("read bytes: %s, %s", tsUrl, err.Error())
 	}
 	sf := d.result.M3u8.Segments[segIndex]
 	if sf == nil {
