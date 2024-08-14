@@ -525,29 +525,39 @@ func mp4ToTs(ffmpegPath string, filePath string) (string, error) {
 
 func Cmd(showDetail bool, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
-	stderrPipe, err := cmd.StderrPipe()
+	// 将标准输出和标准错误输出设为nil，以避免任何输出
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	// 执行命令
+	err := cmd.Run()
 	if err != nil {
 		return err
 	}
-	defer stderrPipe.Close()
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	reader := bufio.NewReader(stderrPipe)
-	for {
-		line, err := reader.ReadBytes('\r')
-		if err != nil || err == io.EOF {
-			break
-		}
-		if showDetail {
-			fmt.Println(string(line))
-		}
-
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil
-	}
 	return nil
+	// stderrPipe, err := cmd.StderrPipe()
+	// if err != nil {
+	// 	return err
+	// }
+	// defer stderrPipe.Close()
+	// if err := cmd.Start(); err != nil {
+	// 	return err
+	// }
+	// reader := bufio.NewReader(stderrPipe)
+	// for {
+	// 	line, err := reader.ReadBytes('\r')
+	// 	if err != nil || err == io.EOF {
+	// 		break
+	// 	}
+	// 	if showDetail {
+	// 		fmt.Println(string(line))
+	// 	}
+
+	// }
+	// if err := cmd.Wait(); err != nil {
+	// 	return nil
+	// }
+	// return nil
 }
 
 func (d *Downloader) next() (segIndex int, end bool, err error) {
