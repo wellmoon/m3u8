@@ -477,11 +477,11 @@ func AddWaterMarker(ffmpegPath string, fTemp string, fPath string, markerPath st
 		left = 10
 	}
 	mp4Path := fPath
-	videoInfo := Info(ffmpegPath, fTemp)
-	br := videoInfo.Br
-	if br == 0 {
-		br = 1000
-	}
+	// videoInfo := Info(ffmpegPath, fTemp)
+	// br := videoInfo.Br
+	// if br == 0 {
+	// 	br = 1000
+	// }
 	// if width <= 1280 {
 	// 	width = 600
 	// 	height = 30
@@ -529,9 +529,13 @@ func Cmd(showDetail bool, name string, args ...string) error {
 	cmd.Stderr = nil
 
 	// 执行命令
-	err := cmd.Run()
+	err := cmd.Start()
 	if err != nil {
 		return err
+	}
+	err = cmd.Wait()
+	if err != nil {
+		panic(err)
 	}
 	return nil
 	// stderrPipe, err := cmd.StderrPipe()
