@@ -37,7 +37,7 @@ func main() {
 	if chanSize <= 0 {
 		panic("parameter 'c' must be greater than 0")
 	}
-	downloader, err := dl.NewTask(output, url, nil)
+	downloader, err := dl.NewTask(output, url, nil, nil)
 	if err != nil {
 		panic(err)
 	}

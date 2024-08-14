@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/levigross/grequests"
@@ -23,9 +24,22 @@ var (
 	}
 )
 
-func Get(url string, headers map[string]string) (io.ReadCloser, error) {
-	c := http.Client{
-		Timeout: time.Duration(60) * time.Second,
+func GetByProxy(url string, headers map[string]string, uri *url.URL) (io.ReadCloser, error) {
+
+	var c http.Client
+	if uri == nil {
+		c = http.Client{
+			Timeout: time.Duration(30) * time.Second,
+		}
+	} else {
+		c = http.Client{
+			Timeout: time.Duration(30) * time.Second,
+			Transport: &http.Transport{
+				// 设置代理
+				Proxy:                 http.ProxyURL(uri),
+				ExpectContinueTimeout: 30,
+			},
+		}
 	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -47,10 +61,31 @@ func Get(url string, headers map[string]string) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
+func Get(url string, headers map[string]string) (io.ReadCloser, error) {
+	return GetByProxy(url, headers, nil)
+}
+
 func GetBytes(url string, headers map[string]string) ([]byte, error) {
-	c := http.Client{
-		Timeout: time.Duration(300) * time.Second,
+	return GetBytesByProxy(url, headers, nil)
+}
+
+func GetBytesByProxy(url string, headers map[string]string, uri *url.URL) ([]byte, error) {
+	var c http.Client
+	if uri == nil {
+		c = http.Client{
+			Timeout: time.Duration(30) * time.Second,
+		}
+	} else {
+		c = http.Client{
+			// Timeout: time.Duration(30) * time.Second,
+			Transport: &http.Transport{
+				// 设置代理
+				Proxy: http.ProxyURL(uri),
+				// ExpectContinueTimeout: 30,
+			},
+		}
 	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err

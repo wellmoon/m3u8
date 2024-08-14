@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/url"
+	"strings"
 
 	"github.com/wellmoon/m3u8/tool"
 )
@@ -15,15 +16,25 @@ type Result struct {
 	Keys map[int]string
 }
 
-func FromURL(link string, headers map[string]string) (*Result, error) {
+func FromURL(link string, headers map[string]string, uri *url.URL) (*Result, error) {
 	u, err := url.Parse(link)
 	if err != nil {
 		return nil, err
 	}
 	link = u.String()
-	body, err := tool.Get(link, headers)
+	body, err := tool.GetByProxy(link, headers, uri)
 	if err != nil {
 		return nil, fmt.Errorf("request m3u8 URL failed: %s", err.Error())
+		// if strings.Contains(err.Error(), "status code 428") && uri != nil {
+		// 	// 尝试换代理请求
+		// 	fmt.Printf("尝试切换代理请求:%s", uri)
+		// 	body, err = tool.GetByProxy(link, headers, uri)
+		// 	if err != nil {
+		// 		return nil, fmt.Errorf("request m3u8 URL failed: %s", err.Error())
+		// 	}
+		// } else {
+		// 	return nil, fmt.Errorf("request m3u8 URL failed: %s", err.Error())
+		// }
 	}
 	//noinspection GoUnhandledErrorResult
 	defer body.Close()
@@ -33,7 +44,7 @@ func FromURL(link string, headers map[string]string) (*Result, error) {
 	}
 	if len(m3u8.MasterPlaylist) != 0 {
 		sf := m3u8.MasterPlaylist[0]
-		return FromURL(tool.ResolveURL(u, sf.URI), headers)
+		return FromURL(tool.ResolveURL(u, sf.URI), headers, uri)
 	}
 	if len(m3u8.Segments) == 0 {
 		return nil, errors.New("can not found any TS file description")
@@ -52,9 +63,14 @@ func FromURL(link string, headers map[string]string) (*Result, error) {
 			// Request URL to extract decryption key
 			keyURL := key.URI
 			keyURL = tool.ResolveURL(u, keyURL)
-			resp, err := tool.Get(keyURL, headers)
+			resp, err := tool.GetByProxy(keyURL, headers, uri)
 			if err != nil {
-				return nil, fmt.Errorf("extract key failed: %s", err.Error())
+				if strings.Contains(err.Error(), "status code 403") {
+					// 如果获取不到key，可能不需要解密
+					continue
+				} else {
+					return nil, fmt.Errorf("extract key failed: %s", err.Error())
+				}
 			}
 			keyByte, err := ioutil.ReadAll(resp)
 			_ = resp.Close()

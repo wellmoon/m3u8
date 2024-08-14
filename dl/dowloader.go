@@ -3,10 +3,10 @@ package dl
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wellmoon/go/utils"
 	"github.com/wellmoon/m3u8/parse"
 	"github.com/wellmoon/m3u8/tool"
 )
@@ -42,13 +43,31 @@ type Downloader struct {
 	WaterMarker       string
 	WaterMarkerWidth  int
 	WaterMarkerHeight int
+	WaterMarkerLeft   int
 	VideoWidth        int
-
-	result *parse.Result
+	VideoHeight       int
+	WaterMakerType    int // 0.loop  1.fix prefix -1.no mark
+	ProxyUrl          string
+	UploadFunc        func(fp string)
+	ProcessFunc       func(finish int32, total int, u string)
+	result            *parse.Result
+	CheckTsFunc       func(tsFile string, hkey string, sizeMap map[string]string) bool
+	CheckTsKey        string
+	CheckTsMap        map[string]string
+	AdFileInfo        map[int64]string // key:文件大小；val:md5
+	SubTitle          string
+	FFmpegPath        string
 }
 
 func (d *Downloader) GetExt() string {
 	return ".ts"
+}
+
+func (d *Downloader) GetFFmpeg() string {
+	if len(d.FFmpegPath) == 0 {
+		return "ffmpeg"
+	}
+	return d.FFmpegPath
 }
 
 func (d *Downloader) GetMergeFilename() string {
@@ -74,8 +93,9 @@ func (d *Downloader) GetDuration() int {
 // }
 
 // NewTask returns a Task instance
-func NewTask(output string, url string, headers map[string]string) (*Downloader, error) {
-	result, err := parse.FromURL(url, headers)
+func NewTask(output string, url string, headers map[string]string, uri *url.URL) (*Downloader, error) {
+	result, err := parse.FromURL(url, headers, uri)
+
 	if err != nil {
 		return nil, err
 	}
@@ -130,15 +150,27 @@ func (d *Downloader) Start(concurrency int, parseUrl func(string) string) error 
 			}()
 			if err := d.download(idx, parseUrl); err != nil {
 				// Back into the queue, retry request
-				// fmt.Printf("[failed] %s\n", err.Error())
+				fmt.Printf("[failed] %s\n", err.Error())
+				if strings.HasPrefix(err.Error(), "decryt") {
+					return
+				}
+				if strings.HasPrefix(err.Error(), "no such file or directory") {
+					return
+				}
 				if err := d.back(idx); err != nil {
 					fmt.Println(err.Error())
 				}
+
 			}
 		}(tsIdx)
 
 	}
 	wg.Wait()
+	if d.UploadFunc != nil {
+		// 已上传ts文件，无需合并
+		_ = os.RemoveAll(d.tsFolder)
+		return nil
+	}
 	if len(d.WaterMarker) == 0 {
 		if err := d.merge(); err != nil {
 			return err
@@ -155,12 +187,67 @@ func (d *Downloader) Start(concurrency int, parseUrl func(string) string) error 
 
 func (d *Downloader) download(segIndex int, parseUrl func(url string) string) error {
 	tsFilename := d.tsFilename(segIndex)
+
 	tsUrl := d.tsURL(segIndex)
 	if parseUrl != nil {
 		tsUrl = parseUrl(tsUrl)
 	}
-	bytes, e := tool.GetBytes(tsUrl, d.headers)
+	if tsUrl == "ad_ts" {
+		// 广告，需要过滤掉
+		fmt.Println(tsUrl, "is a ad ts, ignore this ts")
+		atomic.AddInt32(&d.finish, 1)
+		fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+		if d.ProcessFunc != nil {
+			d.ProcessFunc(d.finish, d.segLen, tsUrl)
+		}
+		return nil
+	}
+	fPath := filepath.Join(d.tsFolder, tsFilename)
+	fInfo, err := os.Stat(fPath)
+	if err == nil {
+		// 判断是否广告
+		if d.AdFileInfo != nil && len(d.AdFileInfo) > 0 {
+			fsize := fInfo.Size()
+			m, ok := d.AdFileInfo[fsize]
+			if ok {
+				// 判断md5
+				f, _ := os.Open(fPath)
+				m1 := utils.Md5File(f)
+				if m1 == m {
+					// 广告
+					fmt.Println(tsUrl, "is a ad ts, ignore this ts, fileSize is", fsize)
+					atomic.AddInt32(&d.finish, 1)
+					fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+					if d.ProcessFunc != nil {
+						d.ProcessFunc(d.finish, d.segLen, tsUrl)
+					}
+					return nil
+				}
+			}
+		}
+		// 如果ts存在，校验ts文件是否正确，如果正确，则不再下载
+		if d.CheckTsFunc != nil && len(d.CheckTsKey) > 0 {
+			if d.CheckTsFunc(fPath, d.CheckTsKey, d.CheckTsMap) {
+				// Maybe it will be safer in this way...
+				atomic.AddInt32(&d.finish, 1)
+				// tool.DrawProgressBar("Downloading", float32(d.finish)/float32(d.segLen), progressWidth)
+				fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+				if d.ProcessFunc != nil {
+					d.ProcessFunc(d.finish, d.segLen, tsUrl)
+				}
+				return nil
+			} else {
+				fmt.Println(fPath, "exist but not correct, need redownload")
+			}
+		}
+	}
+	var proxyUri *url.URL
+	if len(d.ProxyUrl) > 0 {
+		proxyUri, _ = url.Parse(d.ProxyUrl)
+	}
+	bytes, e := tool.GetBytesByProxy(tsUrl, d.headers, proxyUri)
 	if e != nil {
+		fmt.Println(e.Error())
 		if strings.Contains(e.Error(), "429") {
 			time.Sleep(time.Duration(3) * time.Second)
 		}
@@ -171,7 +258,7 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 		return fmt.Errorf("request %s, %s", tsUrl, e.Error())
 	}
 	//noinspection GoUnhandledErrorResult
-	fPath := filepath.Join(d.tsFolder, tsFilename)
+
 	fTemp := fPath + tsTempFileSuffix
 	f, err := os.Create(fTemp)
 	if err != nil {
@@ -183,10 +270,12 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	}
 	key, ok := d.result.Keys[sf.KeyIndex]
 	if ok && key != "" {
-		bytes, err = tool.AES128Decrypt(bytes, []byte(key),
+		tempBytes, err := tool.AES128Decrypt(bytes, []byte(key),
 			[]byte(d.result.M3u8.Keys[sf.KeyIndex].IV), tsUrl)
 		if err != nil {
-			return fmt.Errorf("decryt: %s, %s", tsUrl, err.Error())
+			// return fmt.Errorf("decryt: %s, %s", tsUrl, err.Error())
+		} else {
+			bytes = tempBytes
 		}
 	}
 	// https://en.wikipedia.org/wiki/MPEG_transport_stream
@@ -206,29 +295,62 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	}
 	// Release file resource to rename file
 	_ = f.Close()
+	finfo := Info(d.GetFFmpeg(), fTemp)
+	if segIndex == 0 {
+		d.VideoWidth = finfo.Width
+		d.VideoHeight = finfo.Height
+	} else {
+		if d.VideoWidth > 0 && d.VideoWidth != finfo.Width || d.VideoHeight > 0 && d.VideoHeight != finfo.Height {
+			// 视频大小与第一个不同，可能是广告，需要过滤掉
+			atomic.AddInt32(&d.finish, 1)
+			return nil
+		}
+	}
 	if err = d.rename(fTemp, fPath, segIndex); err != nil {
-		return err
+		fmt.Println("rename error: ", err.Error())
+		// return err
+	}
+
+	if d.UploadFunc != nil {
+		d.UploadFunc(fPath)
 	}
 
 	// Maybe it will be safer in this way...
 	atomic.AddInt32(&d.finish, 1)
 	//tool.DrawProgressBar("Downloading", float32(d.finish)/float32(d.segLen), progressWidth)
 	fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+	if d.ProcessFunc != nil {
+		d.ProcessFunc(d.finish, d.segLen, tsUrl)
+	}
 	return nil
 }
 
 func (d *Downloader) rename(fTemp string, fPath string, segIndex int) error {
-	if d.VideoWidth == 0 {
-		videoInfo := Info(fTemp)
-		d.VideoWidth = videoInfo.Width
-		fmt.Println("video width ", d.VideoWidth)
+	// if d.VideoWidth == 0 {
+	// 	videoInfo := Info(fTemp)
+	// 	d.VideoWidth = videoInfo.Width
+	// }
+	// if d.VideoWidth <= 1000 {
+	// 	return os.Rename(fTemp, fPath)
+	// }
+	var con bool
+	if d.WaterMakerType == 0 {
+		con = len(d.WaterMarker) > 0 && (segIndex%100 < 7)
+	} else if d.WaterMakerType == 1 {
+		con = len(d.WaterMarker) > 0 && segIndex < 3
+	} else if d.WaterMakerType == -1 {
+		// 不加水印
+		con = false
+	} else {
+		// 全部加水印
+		con = true
 	}
-	if d.VideoWidth <= 640 {
-		return os.Rename(fTemp, fPath)
-	}
-	if len(d.WaterMarker) > 0 && (segIndex%100 < 10) {
-		fmt.Println("need add water marker", segIndex)
-		err := AddWaterMarker(fTemp, fPath, d.WaterMarker, d.WaterMarkerWidth, d.WaterMarkerHeight)
+	if con {
+		err := AddWaterMarker(d.GetFFmpeg(), fTemp, fPath, d.WaterMarker, d.WaterMarkerWidth, d.WaterMarkerHeight, d.WaterMarkerLeft)
+		if err != nil {
+			fmt.Println("add water marker err ", err)
+			return err
+		}
 		os.RemoveAll(fTemp)
 		if err == nil {
 			return nil
@@ -257,9 +379,9 @@ func TimeToSecond(t string) int {
 	return second + minute*60 + hour*3600
 }
 
-func Info(filePath string) *VideoInfo {
+func Info(ffmpegPath string, filePath string) *VideoInfo {
 	res := &VideoInfo{}
-	cmd := exec.Command("ffmpeg", "-i", filePath)
+	cmd := exec.Command(ffmpegPath, "-i", filePath)
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return res
@@ -326,26 +448,55 @@ func RegOneStr(source string, pattern string) string {
 	return ""
 }
 
-func AddWaterMarker(fTemp string, fPath string, markerPath string, width int, height int) error {
+// func AddTextWaterMarker(fTemp string, fPath string, text string) error {
+// 	mp4Path := fPath
+// 	videoInfo := Info(fTemp)
+// 	br := videoInfo.Br
+// 	if br == 0 {
+// 		br = 1000
+// 	}
+// 	// ffmpeg -i 0.ts -vf "drawtext=text='电报@TopMovieCN':x=(w-text_w)/2:y=10:fontsize=20:fontcolor=orange:shadowy=2" output.mp4
+// 	fmt.Println(br)
+// 	err := Cmd(false, "ffmpeg", "-y", "-i", fTemp, "-acodec", "copy", "-b:v", strconv.Itoa(br)+"k", "-vf",
+// 		"drawtext=text='"+text+"':x=(w-text_w)/2:y=10:fontsize=20:fontcolor=orange:shadowy=2",
+// 		mp4Path)
+
+// 	if err != nil {
+// 		fmt.Println("ts to mp4 error", err)
+// 		return err
+// 	}
+// 	// _, err = mp4ToTs(mp4Path)
+// 	// return err
+// 	return nil
+// }
+
+func AddWaterMarker(ffmpegPath string, fTemp string, fPath string, markerPath string, width int, height int, left int) error {
 	// dir, fileName := path.Split(fPath)
 	// fileName = strings.ReplaceAll(fileName, ".ts", ".mp4")
 	// mp4Path := filepath.Join(dir, fileName)
+	if left == 0 {
+		left = 10
+	}
 	mp4Path := fPath
-	videoInfo := Info(fTemp)
+	videoInfo := Info(ffmpegPath, fTemp)
 	br := videoInfo.Br
 	if br == 0 {
 		br = 1000
 	}
-	if width == 0 {
-		width = 200
-	}
-	if height == 0 {
-		height = 100
-	}
+	// if width <= 1280 {
+	// 	width = 600
+	// 	height = 30
+	// }
 	// err := Cmd(false, "ffmpeg", "-y", "-i", fTemp, "-c:v", "libx264", "-b:v", strconv.Itoa(br)+"k", "-bufsize", strconv.Itoa(br)+"k", "-c:a", "copy", "-vf", "movie="+markerPath+"[watermark];[in][watermark] overlay=10:10[out]", mp4Path)
 	// ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo
-	err := Cmd(false, "ffmpeg", "-y", "-i", fTemp, "-i", markerPath, "-c:v", "libx264", "-b:v", strconv.Itoa(br)+"k", "-bufsize",
-		strconv.Itoa(br)+"k", "-c:a", "copy", "-filter_complex", "[1:v] scale="+strconv.Itoa(width)+":"+strconv.Itoa(height)+" [logo];[0:v][logo]overlay=x=10:y=10",
+	// err := Cmd(false, "ffmpeg", "-y", "-i", fTemp, "-i", markerPath, "-c:v", "libx264", "-b:v", strconv.Itoa(br)+"k", "-bufsize",
+	// 	strconv.Itoa(br)+"k", "-c:a", "copy", "-filter_complex", "[1:v] scale="+strconv.Itoa(width)+":"+strconv.Itoa(height)+" [logo];[0:v][logo]overlay=x=10:y=10",
+	// 	"-threads", strconv.Itoa(runtime.NumCPU()), "-preset",
+	// 	"superfast",
+	// 	mp4Path)
+	// brStr := strconv.Itoa(br)
+	err := Cmd(false, ffmpegPath, "-y", "-i", fTemp, "-i", markerPath, "-c:v", "libx264",
+		"-c:a", "copy", "-filter_complex", "[1:v] scale="+strconv.Itoa(width)+":"+strconv.Itoa(height)+" [logo];[0:v][logo]overlay=x="+strconv.Itoa(left)+":y=10",
 		"-threads", strconv.Itoa(runtime.NumCPU()), "-preset",
 		"superfast",
 		mp4Path)
@@ -359,12 +510,12 @@ func AddWaterMarker(fTemp string, fPath string, markerPath string, width int, he
 	return nil
 }
 
-func mp4ToTs(filePath string) (string, error) {
+func mp4ToTs(ffmpegPath string, filePath string) (string, error) {
 	// ffmpeg -i javtvm.mp4 -c:v copy javtvm.ts
 	dir, fileName := path.Split(filePath)
 	fileName = strings.ReplaceAll(fileName, ".mp4", ".ts")
 	tsPath := filepath.Join(dir, fileName)
-	err := Cmd(false, "ffmpeg", "-i", filePath, "-c:v", "copy", tsPath)
+	err := Cmd(false, ffmpegPath, "-i", filePath, "-c:v", "copy", tsPath)
 	if err != nil {
 		return "", err
 	}
@@ -473,7 +624,7 @@ func (d *Downloader) merge() error {
 
 	if mergedCount != d.segLen {
 		fmt.Printf("[warning] \n%d files merge failed", d.segLen-mergedCount)
-		return errors.New("merge failded")
+		// return errors.New("merge failded")
 	}
 	// Remove `ts` folder
 	_ = os.RemoveAll(d.tsFolder)
@@ -507,7 +658,7 @@ func (d *Downloader) mergeByFfmpeg() error {
 		in = append(in, indexFile)
 	}
 	fmt.Println("in", in)
-	videoMerge(in, mFilePath)
+	videoMerge(d.GetFFmpeg(), in, mFilePath)
 	// Remove `ts` folder
 	_ = os.RemoveAll(d.tsFolder)
 	fmt.Printf("\n[output] %s\n", mFilePath)
@@ -515,10 +666,10 @@ func (d *Downloader) mergeByFfmpeg() error {
 	return nil
 }
 
-func videoMerge(in []string, out string) {
+func videoMerge(ffmpegPath string, in []string, out string) {
 	//fmt.Println(in, out)
-	cmdStr := fmt.Sprintf("ffmpeg -i concat:%s -acodec copy -vcodec copy -absf aac_adtstoasc %s",
-		strings.Join(in, "|"), out)
+	cmdStr := fmt.Sprintf("%s -i concat:%s -acodec copy -vcodec copy -absf aac_adtstoasc %s",
+		ffmpegPath, strings.Join(in, "|"), out)
 	args := strings.Split(cmdStr, " ")
 	msg, err := CmdArr(args[0], args[1:])
 	if err != nil {
