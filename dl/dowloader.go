@@ -2,7 +2,6 @@ package dl
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -681,25 +680,23 @@ func videoMerge(ffmpegPath string, in []string, out string) {
 	cmdStr := fmt.Sprintf("%s -i concat:%s -acodec copy -vcodec copy -absf aac_adtstoasc %s",
 		ffmpegPath, strings.Join(in, "|"), out)
 	args := strings.Split(cmdStr, " ")
-	msg, err := CmdArr(args[0], args[1:])
+	err := CmdArr(args[0], args[1:])
 	if err != nil {
-		fmt.Printf("videoMerge failed, %v, output: %v\n", err, msg)
+		fmt.Printf("videoMerge failed, %v\n", err)
 		return
 	}
 }
 
-func CmdArr(commandName string, params []string) (string, error) {
+func CmdArr(commandName string, params []string) error {
 	cmd := exec.Command(commandName, params...)
-	//fmt.Println("Cmd", cmd.Args)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	err := cmd.Start()
 	if err != nil {
-		return "", err
+		return err
 	}
 	err = cmd.Wait()
-	return out.String(), err
+	return err
 }
 
 func (d *Downloader) tsURL(segIndex int) string {
