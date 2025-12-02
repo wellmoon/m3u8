@@ -2,6 +2,9 @@ package dl
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wellmoon/go/logger"
 	"github.com/wellmoon/go/utils"
 	"github.com/wellmoon/m3u8/parse"
 	"github.com/wellmoon/m3u8/tool"
@@ -29,6 +33,13 @@ const (
 	// mergeTSFilename  = "main.mp4"
 	tsTempFileSuffix = "_tmp"
 	progressWidth    = 40
+)
+
+const (
+	globalAdStatsFileName      = "ad_md5_stats.json"     // 全局 md5 统计文件
+	globalAdCandidatesFileName = "ad_md5_candidates.txt" // 疑似广告 md5 列表
+	globalAdSampleDirName      = "ad_samples"            // 存放疑似广告 ts 样本的目录
+	globalAdMinCount           = 5                       // 认为是广告的全局出现次数阈值
 )
 
 type Downloader struct {
@@ -56,6 +67,11 @@ type Downloader struct {
 	AdFileInfo        map[int64]string // key:文件大小；val:md5
 	SubTitle          string
 	FFmpegPath        string
+
+	// 广告过滤相关：按 ts 内容的 MD5 过滤 & 统计
+	AdMD5     map[string]struct{} // 命中的 md5 视为广告，直接跳过
+	md5Count  map[string]int      // 当前任务内每个 md5 出现次数，用于分析候选广告
+	md5Sample map[string]string   // 每个 md5 记录一个 ts 文件名样本，便于复制出来检查
 }
 
 func (d *Downloader) GetExt() string {
@@ -117,11 +133,16 @@ func NewTask(output string, url string, headers map[string]string, uri *url.URL)
 		return nil, fmt.Errorf("create ts folder '[%s]' failed: %s", tsFolder, err.Error())
 	}
 	d := &Downloader{
-		folder:   folder,
-		tsFolder: tsFolder,
-		result:   result,
-		headers:  headers,
+		folder:    folder,
+		tsFolder:  tsFolder,
+		result:    result,
+		headers:   headers,
+		md5Count:  make(map[string]int),
+		md5Sample: make(map[string]string),
 	}
+	// 初始化全局广告 md5 黑名单（基于历史统计）
+	d.initGlobalAdMD5()
+
 	d.segLen = len(result.M3u8.Segments)
 	d.queue = genSlice(d.segLen)
 	return d, nil
@@ -165,6 +186,15 @@ func (d *Downloader) Start(concurrency int, parseUrl func(string) string) error 
 
 	}
 	wg.Wait()
+
+	// 将本次下载的 md5 统计合并到全局统计中，并生成候选广告列表和样本
+	if err := d.UpdateGlobalAdStats(); err != nil {
+		fmt.Println("update global ad stats error:", err)
+	}
+
+	// 打印当前任务内可疑广告片段的 md5（出现次数很多的 ts）
+	d.DumpAdCandidates(10)
+
 	if d.UploadFunc != nil {
 		// 已上传ts文件，无需合并
 		_ = os.RemoveAll(d.tsFolder)
@@ -258,11 +288,6 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 	}
 	//noinspection GoUnhandledErrorResult
 
-	fTemp := fPath + tsTempFileSuffix
-	f, err := os.Create(fTemp)
-	if err != nil {
-		return fmt.Errorf("create file: %s, %s", tsFilename, err.Error())
-	}
 	sf := d.result.M3u8.Segments[segIndex]
 	if sf == nil {
 		return fmt.Errorf("invalid segment index: %d", segIndex)
@@ -288,9 +313,49 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 			break
 		}
 	}
+
+	// 先按内容计算 md5，用于广告过滤和统计
+	md5v := md5Bytes(bytes)
+	if d.md5Count != nil {
+		d.lock.Lock()
+		d.md5Count[md5v]++
+		// 记录一个样本 ts 文件名，后续可以复制到专门目录检查
+		if d.md5Sample != nil {
+			if _, exists := d.md5Sample[md5v]; !exists {
+				d.md5Sample[md5v] = tsFilename
+			}
+		}
+		d.lock.Unlock()
+	}
+	// 方便后续用日志做全局统计：一行一个 ts 的 md5
+	fmt.Printf("[ts-md5] idx=%d md5=%s url=%s\n", segIndex, md5v, tsUrl)
+
+	// 如果在 AdMD5 黑名单中，直接视为广告 ts，跳过写盘
+	if d.AdMD5 != nil {
+		if _, ok := d.AdMD5[md5v]; ok {
+			fmt.Println(tsUrl, "is a ad ts by md5, ignore this ts")
+			atomic.AddInt32(&d.finish, 1)
+			fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
+			if d.ProcessFunc != nil {
+				d.ProcessFunc(d.finish, d.segLen, tsUrl)
+			}
+			return nil
+		}
+	}
+
+	fTemp := fPath + tsTempFileSuffix
+	f, err := os.Create(fTemp)
+	if err != nil {
+		return fmt.Errorf("create file: %s, %s", tsFilename, err.Error())
+	}
 	w := bufio.NewWriter(f)
 	if _, err := w.Write(bytes); err != nil {
+		_ = f.Close()
 		return fmt.Errorf("write to %s: %s", fTemp, err.Error())
+	}
+	if err := w.Flush(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("flush to %s: %s", fTemp, err.Error())
 	}
 	// Release file resource to rename file
 	_ = f.Close()
@@ -447,6 +512,107 @@ func RegOneStr(source string, pattern string) string {
 	return ""
 }
 
+func md5Bytes(b []byte) string {
+	h := md5.Sum(b)
+	return hex.EncodeToString(h[:])
+}
+
+type AdStats struct {
+	Counts map[string]int `json:"counts"`
+}
+
+func globalBaseDir() string {
+	if dir, err := tool.CurrentDir(); err == nil {
+		return dir
+	}
+	return "."
+}
+
+func globalAdStatsPath() string {
+	return filepath.Join(globalBaseDir(), globalAdStatsFileName)
+}
+
+func globalAdCandidatesPath() string {
+	return filepath.Join(globalBaseDir(), globalAdCandidatesFileName)
+}
+
+func globalAdSampleDirPath() string {
+	return filepath.Join(globalBaseDir(), globalAdSampleDirName)
+}
+
+func loadGlobalAdStats() (*AdStats, error) {
+	path := globalAdStatsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &AdStats{Counts: make(map[string]int)}, nil
+		}
+		return nil, err
+	}
+	stats := &AdStats{Counts: make(map[string]int)}
+	if err := json.Unmarshal(data, stats); err != nil {
+		// 解析失败时重置为空，避免整个功能不可用
+		stats.Counts = make(map[string]int)
+	}
+	if stats.Counts == nil {
+		stats.Counts = make(map[string]int)
+	}
+	return stats, nil
+}
+
+func saveGlobalAdStats(stats *AdStats) error {
+	path := globalAdStatsPath()
+	data, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func writeGlobalAdCandidatesFile(stats *AdStats) error {
+	path := globalAdCandidatesPath()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	for md5v, cnt := range stats.Counts {
+		if cnt >= globalAdMinCount {
+			// 一行一个：count md5
+			line := fmt.Sprintf("%d %s\n", cnt, md5v)
+			if _, err := w.WriteString(line); err != nil {
+				return err
+			}
+		}
+	}
+	return w.Flush()
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
+		return err
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
 // func AddTextWaterMarker(fTemp string, fPath string, text string) error {
 // 	mp4Path := fPath
 // 	videoInfo := Info(fTemp)
@@ -535,7 +701,8 @@ func Cmd(showDetail bool, name string, args ...string) error {
 	}
 	err = cmd.Wait()
 	if err != nil {
-		panic(err)
+		logger.Error("cmd err : {}", err)
+		return err
 	}
 	return nil
 	// stderrPipe, err := cmd.StderrPipe()
@@ -628,7 +795,8 @@ func (d *Downloader) merge() error {
 			fmt.Printf("write files %d error, err is %s\n ", segIndex, err)
 			continue
 		}
-		os.Remove(tsFilename)
+		// 正确删除 ts 子目录中的分片文件
+		_ = os.Remove(filepath.Join(d.tsFolder, tsFilename))
 		mergedCount++
 		tool.DrawProgressBar("merge",
 			float32(mergedCount)/float32(d.segLen), progressWidth)
@@ -718,4 +886,85 @@ func genSlice(len int) []int {
 		s = append(s, i)
 	}
 	return s
+}
+
+func (d *Downloader) DumpAdCandidates(minCount int) {
+	if d.md5Count == nil {
+		return
+	}
+	if minCount <= 0 {
+		minCount = 10
+	}
+	fmt.Printf("---- ad candidate md5 (count >= %d) ----\n", minCount)
+	for md5v, cnt := range d.md5Count {
+		if cnt >= minCount {
+			fmt.Printf("md5=%s count=%d\n", md5v, cnt)
+		}
+	}
+}
+
+// 基于全局统计初始化广告 md5 黑名单
+func (d *Downloader) initGlobalAdMD5() {
+	stats, err := loadGlobalAdStats()
+	if err != nil {
+		fmt.Println("load global ad stats error:", err)
+		return
+	}
+	if d.AdMD5 == nil {
+		d.AdMD5 = make(map[string]struct{})
+	}
+	for md5v, cnt := range stats.Counts {
+		if cnt >= globalAdMinCount {
+			// 认为是广告，加入黑名单
+			d.AdMD5[md5v] = struct{}{}
+		}
+	}
+}
+
+// 将本次下载的 md5 计数合并进全局统计，并为达到阈值的 md5 生成 ts 样本文件
+func (d *Downloader) UpdateGlobalAdStats() error {
+	if d.md5Count == nil {
+		return nil
+	}
+	stats, err := loadGlobalAdStats()
+	if err != nil {
+		return err
+	}
+	// 合并本次任务的统计
+	for md5v, cnt := range d.md5Count {
+		stats.Counts[md5v] += cnt
+	}
+
+	// 为达到阈值的 md5 复制一个 ts 样本到全局广告目录
+	sampleDir := globalAdSampleDirPath()
+	if err := os.MkdirAll(sampleDir, os.ModePerm); err != nil {
+		return err
+	}
+	for md5v, total := range stats.Counts {
+		if total >= globalAdMinCount {
+			samplePath := filepath.Join(sampleDir, md5v+d.GetExt())
+			if _, err := os.Stat(samplePath); err == nil {
+				// 已经有样本文件了
+				continue
+			}
+			// 尝试从本次任务的样本里找一个 ts 源文件复制出来
+			if d.md5Sample != nil {
+				if tsName, ok := d.md5Sample[md5v]; ok {
+					src := filepath.Join(d.tsFolder, tsName)
+					if _, err := os.Stat(src); err == nil {
+						_ = copyFile(src, samplePath)
+					}
+				}
+			}
+		}
+	}
+
+	// 保存全局统计并生成候选列表文件
+	if err := saveGlobalAdStats(stats); err != nil {
+		return err
+	}
+	if err := writeGlobalAdCandidatesFile(stats); err != nil {
+		return err
+	}
+	return nil
 }
