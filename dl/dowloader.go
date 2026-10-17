@@ -72,6 +72,10 @@ type Downloader struct {
 	AdMD5     map[string]struct{} // 命中的 md5 视为广告，直接跳过
 	md5Count  map[string]int      // 当前任务内每个 md5 出现次数，用于分析候选广告
 	md5Sample map[string]string   // 每个 md5 记录一个 ts 文件名样本，便于复制出来检查
+
+	// 广告 ts 上报回调，参数为 md5 和 ts 的 url
+	ReportAdTs       func(md5v, url string)
+	ReportHeaderAdTs func(headerMd5, url string)
 }
 
 func (d *Downloader) GetExt() string {
@@ -328,12 +332,24 @@ func (d *Downloader) download(segIndex int, parseUrl func(url string) string) er
 		d.lock.Unlock()
 	}
 	// 方便后续用日志做全局统计：一行一个 ts 的 md5
-	fmt.Printf("[ts-md5] idx=%d md5=%s url=%s\n", segIndex, md5v, tsUrl)
+	// fmt.Printf("[ts-md5] idx=%d md5=%s url=%s\n", segIndex, md5v, tsUrl)
 
 	// 如果在 AdMD5 黑名单中，直接视为广告 ts，跳过写盘
 	if d.AdMD5 != nil {
 		if _, ok := d.AdMD5[md5v]; ok {
 			fmt.Println(tsUrl, "is a ad ts by md5, ignore this ts")
+
+			// 命中广告时回调上报（例如写入 Redis，供在线播放时跳过）
+			if d.ReportAdTs != nil {
+				d.ReportAdTs(md5v, tsUrl)
+			}
+			// 命中广告时顺带计算一个“头部 md5”，用于后续对历史 ts 做快速检测
+			if d.ReportHeaderAdTs != nil {
+				// 这里取前 4KB 作为头部特征，可按需要调整
+				headMd5 := md5BytesPrefix(bytes, 4096)
+				d.ReportHeaderAdTs(headMd5, tsUrl)
+			}
+
 			atomic.AddInt32(&d.finish, 1)
 			fmt.Printf("[download %6.2f%%] %s\n", float32(d.finish)/float32(d.segLen)*100, tsUrl)
 			if d.ProcessFunc != nil {
@@ -515,6 +531,18 @@ func RegOneStr(source string, pattern string) string {
 func md5Bytes(b []byte) string {
 	h := md5.Sum(b)
 	return hex.EncodeToString(h[:])
+}
+
+// 仅对前 n 个字节做 md5，作为“头部特征”
+// 如果 n <= 0 或者数据长度小于 n，则退化为完整 md5
+func md5BytesPrefix(b []byte, n int) string {
+	if n <= 0 {
+		return md5Bytes(b)
+	}
+	if len(b) > n {
+		b = b[:n]
+	}
+	return md5Bytes(b)
 }
 
 type AdStats struct {
